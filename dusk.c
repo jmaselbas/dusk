@@ -343,6 +343,42 @@ midi_update(void)
 	midi_len = rem;
 }
 
+#include <sys/inotify.h>
+int notify;
+
+void
+init_inotify(void)
+{
+	int ret;
+
+	notify = inotify_init1(IN_NONBLOCK);
+	if (notify < 0) {
+		printf("inotify fail %d\n", notify);
+		return;
+	}
+
+	ret = inotify_add_watch(notify, frag_name, IN_MODIFY);
+	if (ret < 0) {
+		close(notify);
+		notify = 0;
+		printf("inotify add watch fail %d\n", ret);
+		return;
+	}
+}
+
+void
+poll_inotify(void)
+{
+	struct inotify_event iev;
+	ssize_t ret;
+
+	do {
+		ret = read(notify, &iev, sizeof(iev));
+		if (ret > 0)
+			reloadshader();
+	} while (ret > 0);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -366,6 +402,7 @@ main(int argc, char **argv)
 	frag_name = argv[1];
 
 	initmidi();
+	init_inotify();
 
 	initglfw();
 
@@ -378,6 +415,7 @@ main(int argc, char **argv)
 	{
 		glfwPollEvents();
 		midi_update();
+		poll_inotify();
 		update();
 		render();
 		glfwSwapBuffers(window);
