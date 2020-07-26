@@ -14,6 +14,7 @@
 
 #define LEN(a) (sizeof(a)/sizeof(*a))
 
+int verbose;
 char *argv0;
 unsigned int width = 1080;
 unsigned int height = 800;
@@ -30,6 +31,11 @@ GLuint frag_size;
 
 char logbuf[4096];
 GLsizei logsize;
+
+#include <alsa/asoundlib.h>
+
+snd_rawmidi_t *midi_rx;
+unsigned char midi_cc[256];
 
 static void
 die(const char *fmt, ...)
@@ -185,6 +191,8 @@ static void
 update(void)
 {
 	GLint location;
+	char cc[] = "cc000";
+	int i;
 
 	location = glGetUniformLocation(sprg, "fGlobalTime");
 	if (location >= 0)
@@ -193,6 +201,13 @@ update(void)
 	location = glGetUniformLocation(sprg, "v2Resolution");
 	if (location >= 0)
 		glProgramUniform2f(sprg, location, width, height);
+
+	for (i = 0; i < 128; i++) {
+		snprintf(cc, sizeof("cc000"), "cc%d", i);
+		location = glGetUniformLocation(sprg, cc);
+		if (location >= 0)
+			glProgramUniform1f(sprg, location, midi_cc[i] / 127.0f);
+	}
 }
 
 static void
@@ -202,6 +217,9 @@ key_callback(GLFWwindow *window, int key, int scancode, int action, int mods)
 
 	if (action == GLFW_PRESS) {
 		switch (key) {
+		case 'V':
+			verbose = !verbose;
+			break;
 		case 'R':
 			reloadshader();
 			break;
@@ -263,6 +281,68 @@ usage(void)
 	exit(1);
 }
 
+void
+initmidi(void)
+{
+	char *dev;
+	int ret;
+
+	dev = getenv("MIDI_DEV");
+	if (!dev)
+		dev = "virtual";
+
+	ret = snd_rawmidi_open(&midi_rx, NULL, dev, SND_RAWMIDI_NONBLOCK);
+	if (ret < 0) {
+		printf("snd_rawmidi_open: %d\n", ret);
+		return;
+	}
+}
+
+void
+midi_update(void)
+{
+	static unsigned char midi_buf[1024];
+	static size_t midi_len;
+	unsigned char *buf;
+	unsigned char sts, ccn, ccv;
+	int rem;
+	int ret;
+
+	if (!midi_rx)
+		return;
+
+	ret = snd_rawmidi_read(midi_rx, midi_buf + midi_len, sizeof(midi_buf) - midi_len);
+	if (ret < 0) {
+		if (ret != -EAGAIN)
+			printf("snd_rawmidi_read: %d %s\n", ret, snd_strerror(ret));
+		return;
+	}
+
+	midi_len += ret;
+	rem = midi_len;
+	buf = midi_buf;
+	for (; rem > 0; rem--, buf++) {
+		if (buf[0] < 0x80)
+			continue; /* data byte */
+		sts = (buf[0] & 0xf0) >> 4;
+
+		if (sts == 0xb) {
+			/* control change */
+			if (rem >= 2) {
+				ccn = buf[1];
+				ccv = buf[2];
+				midi_cc[ccn] = ccv;
+				if (verbose)
+					printf("cc%d = %d\n", ccn, ccv);
+				rem -= 2;
+				buf += 2;
+			}
+		}
+	}
+	memmove(midi_buf, buf, rem);
+	midi_len = rem;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -285,6 +365,8 @@ main(int argc, char **argv)
 	close(fd);
 	frag_name = argv[1];
 
+	initmidi();
+
 	initglfw();
 
 	ret = glewInit();
@@ -295,6 +377,7 @@ main(int argc, char **argv)
 	while (!glfwWindowShouldClose(window))
 	{
 		glfwPollEvents();
+		midi_update();
 		update();
 		render();
 		glfwSwapBuffers(window);
