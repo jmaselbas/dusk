@@ -501,40 +501,44 @@ jack_fini(void)
 	jack_client_close(jack);
 }
 
-#include <sys/inotify.h>
-int notify;
+#include <sys/types.h>
+#include <sys/stat.h>
+
+__time_t last_time;
 
 void
 init_inotify(void)
 {
+	struct stat sb;
 	int ret;
 
-	notify = inotify_init1(IN_NONBLOCK);
-	if (notify < 0) {
-		printf("inotify fail %d\n", notify);
+	ret = stat(frag_name, &sb);
+	if (ret < 0) {
+		fprintf(stderr, "stat: %s\n", strerror(errno));
 		return;
 	}
 
-	ret = inotify_add_watch(notify, frag_name, IN_MODIFY);
-	if (ret < 0) {
-		close(notify);
-		notify = 0;
-		printf("inotify add watch fail %d\n", ret);
-		return;
-	}
+	last_time = sb.st_ctime;
 }
 
 void
 poll_inotify(void)
 {
-	struct inotify_event iev;
-	ssize_t ret;
+	struct stat sb;
+	int ret;
 
-	do {
-		ret = read(notify, &iev, sizeof(iev));
-		if (ret > 0)
-			reloadshader();
-	} while (ret > 0);
+	ret = stat(frag_name, &sb);
+	if (ret < 0) {
+		/* file is probably beeing saved */
+		if (errno != ENOENT)
+			fprintf(stderr, "stat '%s': %s\n", frag_name, strerror(errno));
+		return;
+	}
+
+	if (last_time != sb.st_ctime) {
+		last_time = sb.st_ctime;
+		reloadshader();
+	}
 }
 
 int
