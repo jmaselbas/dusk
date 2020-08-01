@@ -12,6 +12,11 @@
 #include <GL/glew.h>
 #include <GLFW/glfw3.h>
 
+struct texture {
+	GLenum unit;
+	GLuint id;
+};
+
 #define LEN(a) (sizeof(a)/sizeof(*a))
 
 int verbose;
@@ -25,6 +30,9 @@ GLuint sprg;
 GLuint vshd;
 GLuint fshd;
 
+#define FFT_SIZE 512
+struct texture tex_fft;
+
 char *frag_name;
 GLchar *frag;
 GLuint frag_size;
@@ -37,6 +45,17 @@ GLsizei logsize;
 snd_rawmidi_t *midi_rx;
 unsigned char midi_cc[256];
 
+#include <fftw3.h>
+float fftw_in[FFT_SIZE], fftw_out[FFT_SIZE];
+fftwf_plan plan;
+
+#include <jack/jack.h>
+#include <jack/midiport.h>
+
+jack_client_t *jack;
+jack_port_t *midi_port;
+jack_port_t *input_port;
+
 static void
 die(const char *fmt, ...)
 {
@@ -48,6 +67,32 @@ die(const char *fmt, ...)
 
 	glfwTerminate();
 	exit(1);
+}
+
+static GLuint
+create_1dr32_tex(void *data, size_t size) {
+	GLuint tex = 0;
+
+	glGenTextures(1, &tex);
+	glBindTexture(GL_TEXTURE_1D, tex);
+
+	glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_REPEAT );
+	glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+	glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+
+	glTexImage1D(GL_TEXTURE_1D, 0, GL_R32F, size, 0, GL_RED, GL_FLOAT, data);
+
+	glBindTexture(GL_TEXTURE_1D, 0);
+
+	return tex;
+}
+
+static void
+update_1dr32_tex(struct texture *tex, void *data, size_t size)
+{
+	glActiveTexture(tex->unit);
+	glBindTexture(GL_TEXTURE_1D, tex->id);
+	glTexSubImage1D(GL_TEXTURE_1D, 0, 0, size, GL_RED, GL_FLOAT, data);
 }
 
 static void
@@ -125,12 +170,15 @@ initshader(void)
 	GLint size = strlen(vert);
 	int ret;
 
+	tex_fft.unit = GL_TEXTURE0;
+	tex_fft.id = create_1dr32_tex(fftw_out, LEN(fftw_out));
+
 	glGenVertexArrays(1, &quad_vao);
 	glBindVertexArray(quad_vao);
 
 	glGenBuffers(1, &quad_vbo);
 	glBindBuffer(GL_ARRAY_BUFFER, quad_vbo);
-	glBufferData(GL_ARRAY_BUFFER, LEN(quad) * sizeof(float), quad, GL_STATIC_DRAW);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
 	glBindVertexArray(0);
 
 	vshd = glCreateShader(GL_VERTEX_SHADER);
@@ -208,6 +256,15 @@ update(void)
 		if (location >= 0)
 			glProgramUniform1f(sprg, location, midi_cc[i] / 127.0f);
 	}
+
+	location = glGetUniformLocation(sprg, "texFFT");
+	if (location >= 0) {
+		update_1dr32_tex(&tex_fft, fftw_out, LEN(fftw_out));
+
+		glProgramUniform1i(sprg, location, tex_fft.unit);
+		glActiveTexture(tex_fft.unit);
+		glBindTexture(GL_TEXTURE_1D, tex_fft.id);
+	}
 }
 
 static void
@@ -219,6 +276,8 @@ key_callback(GLFWwindow *window, int key, int scancode, int action, int mods)
 		switch (key) {
 		case 'V':
 			verbose = !verbose;
+			printf("--- %s ---\n", verbose ? "verbose" : "quiet");
+
 			break;
 		case 'R':
 			reloadshader();
@@ -282,7 +341,7 @@ usage(void)
 }
 
 void
-initmidi(void)
+alsa_initmidi(void)
 {
 	char *dev;
 	int ret;
@@ -296,10 +355,44 @@ initmidi(void)
 		printf("snd_rawmidi_open: %d\n", ret);
 		return;
 	}
+
+#if 0 /* TODO: create a virtual seq */
+	// Set up the ALSA sequencer client.
+	snd_seq_t *seq;
+	int result = snd_seq_open(&seq, "default", SND_SEQ_OPEN_DUPLEX, SND_SEQ_NONBLOCK);
+	if ( result < 0 ) {
+		errorString_ = "MidiInAlsa::initialize: error creating ALSA sequencer client object.";
+		error( RtMidiError::DRIVER_ERROR, errorString_ );
+		return;
+	}
+
+	// Set client name.
+	snd_seq_set_client_name( seq, clientName.c_str() );
+#endif
 }
 
 void
-midi_update(void)
+midi_process(size_t size, unsigned char *buff)
+{
+	unsigned char sts, ccn, ccv;
+
+	if (size < 3)
+		return;
+
+	sts = (buff[0] & 0xf0) >> 4;
+
+	if (sts == 0xb) {
+		/* control change */
+		ccn = buff[1];
+		ccv = buff[2];
+		midi_cc[ccn] = ccv;
+		if (verbose)
+			printf("cc%d = %d\n", ccn, ccv);
+	}
+}
+
+void
+alsa_midi_update(void)
 {
 	static unsigned char midi_buf[1024];
 	static size_t midi_len;
@@ -321,26 +414,91 @@ midi_update(void)
 	midi_len += ret;
 	rem = midi_len;
 	buf = midi_buf;
-	for (; rem > 0; rem--, buf++) {
+	for (; rem >= 3; rem--, buf++) {
 		if (buf[0] < 0x80)
 			continue; /* data byte */
 		sts = (buf[0] & 0xf0) >> 4;
 
-		if (sts == 0xb) {
-			/* control change */
-			if (rem >= 2) {
-				ccn = buf[1];
-				ccv = buf[2];
-				midi_cc[ccn] = ccv;
-				if (verbose)
-					printf("cc%d = %d\n", ccn, ccv);
-				rem -= 2;
-				buf += 2;
-			}
-		}
+		midi_process(3, buf);
+		rem -= 2;
+		buf += 2;
 	}
 	memmove(midi_buf, buf, rem);
 	midi_len = rem;
+}
+
+int
+jack_process(jack_nframes_t frames, void* arg)
+{
+	void* buffer;
+	jack_nframes_t n, i;
+	jack_midi_event_t event;
+	jack_default_audio_sample_t *in;
+	int r;
+
+	if (midi_port) {
+		buffer = jack_port_get_buffer(midi_port, frames);
+
+		n = jack_midi_get_event_count(buffer);
+		for (i = 0; i < n; i++) {
+			r = jack_midi_event_get (&event, buffer, i);
+			if (r == 0)
+				midi_process(event.size, event.buffer);
+		}
+	}
+
+	if (input_port) {
+		in = jack_port_get_buffer(input_port, frames);
+		for (i = 0; i < frames; i++)
+			fftw_in[i] = in[i];
+		if (plan)
+			fftwf_execute(plan);
+	}
+
+	return 0;
+}
+
+void
+jack_init(void)
+{
+	int ret;
+
+	jack = jack_client_open(argv0, JackNullOption, NULL);
+	if (!jack) {
+		printf("err creating jack client\n");
+		return;
+	}
+
+	ret = jack_set_process_callback(jack, jack_process, 0);
+	if (ret) {
+		fprintf(stderr, "Could not register process callback.\n");
+		return;
+
+	}
+	midi_port = jack_port_register(jack, "input", JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0);
+	if (!midi_port) {
+		fprintf(stderr, "Could not register midi port.\n");
+		return;
+	}
+
+	input_port = jack_port_register(jack, "mono", JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
+	if (!input_port) {
+		fprintf(stderr, "Could not register audio port.\n");
+		return;
+	}
+
+	ret = jack_activate(jack);
+	if (ret) {
+		fprintf(stderr, "Could not activate client.\n");
+		return;
+	}
+}
+
+void
+jack_fini(void)
+{
+	jack_deactivate(jack);
+	jack_client_close(jack);
 }
 
 #include <sys/inotify.h>
@@ -401,7 +559,9 @@ main(int argc, char **argv)
 	close(fd);
 	frag_name = argv[1];
 
-	initmidi();
+	plan = fftwf_plan_r2r_1d(FFT_SIZE, fftw_in, fftw_out, FFTW_FORWARD, FFTW_ESTIMATE);
+
+	jack_init();
 	init_inotify();
 
 	initglfw();
@@ -414,13 +574,12 @@ main(int argc, char **argv)
 	while (!glfwWindowShouldClose(window))
 	{
 		glfwPollEvents();
-		midi_update();
 		poll_inotify();
 		update();
 		render();
 		glfwSwapBuffers(window);
 	}
-
+	jack_fini();
 	glfwTerminate();
 	return 0;
 }
