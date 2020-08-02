@@ -14,6 +14,7 @@
 
 struct texture {
 	GLenum unit;
+	GLenum type;
 	GLuint id;
 };
 
@@ -32,6 +33,8 @@ GLuint fshd;
 
 #define FFT_SIZE 512
 struct texture tex_fft;
+struct texture tex_fft_smth;
+float smth_fac = 0.9;
 
 char *frag_name;
 GLchar *frag;
@@ -47,6 +50,7 @@ unsigned char midi_cc[256];
 
 #include <fftw3.h>
 float fftw_in[FFT_SIZE], fftw_out[FFT_SIZE];
+float fft_smth[FFT_SIZE];
 fftwf_plan plan;
 
 #include <jack/jack.h>
@@ -69,20 +73,22 @@ die(const char *fmt, ...)
 	exit(1);
 }
 
-static GLuint
+static struct texture
 create_1dr32_tex(void *data, size_t size) {
-	GLuint tex = 0;
+	struct texture tex;
+	static GLuint unit = 0;
 
-	glGenTextures(1, &tex);
-	glBindTexture(GL_TEXTURE_1D, tex);
+	tex.unit = unit++;
+	tex.type = GL_TEXTURE_1D;
 
-	glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_REPEAT );
-	glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
-	glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+	glGenTextures(1, &tex.id);
+	glBindTexture(GL_TEXTURE_1D, tex.id);
+
+	glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+	glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_1D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
 	glTexImage1D(GL_TEXTURE_1D, 0, GL_R32F, size, 0, GL_RED, GL_FLOAT, data);
-
-	glBindTexture(GL_TEXTURE_1D, 0);
 
 	return tex;
 }
@@ -90,7 +96,6 @@ create_1dr32_tex(void *data, size_t size) {
 static void
 update_1dr32_tex(struct texture *tex, void *data, size_t size)
 {
-	glActiveTexture(tex->unit);
 	glBindTexture(GL_TEXTURE_1D, tex->id);
 	glTexSubImage1D(GL_TEXTURE_1D, 0, 0, size, GL_RED, GL_FLOAT, data);
 }
@@ -161,17 +166,17 @@ initshader(void)
 		"#version 410 core\n"
 		"in vec3 in_pos;\n"
 		"in vec2 in_texcoord;\n"
-		"out vec2 out_texcoord;\n"
+		"out vec2 texcoord;\n"
 		"void main()\n"
 		"{\n"
 		"  gl_Position = vec4(in_pos.x, in_pos.y, in_pos.z, 1.0);\n"
-		"  out_texcoord = in_texcoord;\n"
+		"  texcoord = in_texcoord;\n"
 		"}\n";
 	GLint size = strlen(vert);
 	int ret;
 
-	tex_fft.unit = GL_TEXTURE0;
-	tex_fft.id = create_1dr32_tex(fftw_out, LEN(fftw_out));
+	tex_fft = create_1dr32_tex(fftw_out, LEN(fftw_out));
+	tex_fft_smth = create_1dr32_tex(fft_smth, LEN(fft_smth));
 
 	glGenVertexArrays(1, &quad_vao);
 	glBindVertexArray(quad_vao);
@@ -260,10 +265,15 @@ update(void)
 	location = glGetUniformLocation(sprg, "texFFT");
 	if (location >= 0) {
 		update_1dr32_tex(&tex_fft, fftw_out, LEN(fftw_out));
-
+		glActiveTexture(GL_TEXTURE0 + tex_fft.unit);
 		glProgramUniform1i(sprg, location, tex_fft.unit);
-		glActiveTexture(tex_fft.unit);
-		glBindTexture(GL_TEXTURE_1D, tex_fft.id);
+	}
+
+	location = glGetUniformLocation(sprg, "texFFTSmoothed");
+	if (location >= 0) {
+		update_1dr32_tex(&tex_fft_smth, fft_smth, LEN(fft_smth));
+		glActiveTexture(GL_TEXTURE0 + tex_fft_smth.unit);
+		glProgramUniform1i(sprg, location, tex_fft_smth.unit);
 	}
 }
 
@@ -427,6 +437,8 @@ alsa_midi_update(void)
 	midi_len = rem;
 }
 
+#define mix(x,y,a) ((x) * (1 - (a)) + (y) * (a))
+
 int
 jack_process(jack_nframes_t frames, void* arg)
 {
@@ -453,6 +465,8 @@ jack_process(jack_nframes_t frames, void* arg)
 			fftw_in[i] = in[i];
 		if (plan)
 			fftwf_execute(plan);
+		for (i = 0; i < LEN(fft_smth); i++)
+			fft_smth[i] =  mix(fftw_out[i], fft_smth[i], smth_fac);
 	}
 
 	return 0;
@@ -563,7 +577,7 @@ main(int argc, char **argv)
 	close(fd);
 	frag_name = argv[1];
 
-	plan = fftwf_plan_r2r_1d(FFT_SIZE, fftw_in, fftw_out, FFTW_FORWARD, FFTW_ESTIMATE);
+	plan = fftwf_plan_r2r_1d(FFT_SIZE, fftw_in, fftw_out, FFTW_REDFT10, FFTW_MEASURE);
 
 	jack_init();
 	init_inotify();
